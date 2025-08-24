@@ -1,7 +1,9 @@
 import requests
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from PIL import Image, ImageTk
 import io
+import os
 import threading
 
 RAINVIEWER_API = "https://api.rainviewer.com/public/weather-maps.json"
@@ -14,36 +16,73 @@ GOOGLE_MAPS_API_KEY = "AIzaSyD3oN5YeEhwEQvmKkN0fNY-EHm6uBa11Qk"
 
 LOCATIONS = [
     {"name": "Miami, FL", "lat": 25.7617, "lon": -80.1918},
-    {"name": "Klamath Falls, OR", "lat": 42.224, "lon": -121.781}
+    {"name": "Portland, OR", "lat": 45.5152, "lon": -122.6784}
 ]
+
 
 REFRESH_INTERVAL = 300000  # 5 minutes in milliseconds
 ANIMATION_DELAY = 120      # ms between frames
 MAX_FRAMES = 100
+RADAR_THREAD_POOL = ThreadPoolExecutor(max_workers=4)
 
+
+# Forecast cache
+_forecast_cache = {}
 def get_hourly_forecast(lat, lon):
+    """Return structured 12-hour local forecast.
+    Structure: {
+       'timezone': <IANA tz name>,
+       'entries': [ { 'time': datetime (tz-aware), 'temp': float, 'weather': str } ...]
+    }
+    On error returns {'timezone': 'UTC', 'entries': []}.
+    """
+    key = (lat, lon)
+    if key in _forecast_cache:
+        return _forecast_cache[key]
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
-        f"latitude={lat}&longitude={lon}&hourly=temperature_2m,weathercode&forecast_days=1"
+        f"latitude={lat}&longitude={lon}&hourly=temperature_2m,weathercode&forecast_days=1&timezone=auto"
     )
     try:
-        r = requests.get(url, timeout=10)
+        r = requests_session.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo  # Python 3.9+
+        except Exception:
+            ZoneInfo = None
+        tz_name = data.get("timezone", "UTC")
         temps = data["hourly"]["temperature_2m"][:12]
         codes = data["hourly"]["weathercode"][:12]
-        times = data["hourly"]["time"][:12]
-        # Simple weather code mapping
+        times = data["hourly"]["time"][:12]  # already localized textual times per open-meteo
         code_map = {
             0: "Clear", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
             45: "Fog", 48: "Depositing Rime Fog", 51: "Drizzle", 61: "Rain",
             71: "Snow", 80: "Rain Showers", 95: "Thunderstorm"
         }
-        weather = [code_map.get(c, str(c)) for c in codes]
-        return list(zip(times, temps, weather))
+        entries = []
+        for t, temp, c in zip(times, temps, codes):
+            # t format: YYYY-MM-DDTHH:MM (local time per timezone=auto)
+            try:
+                dt_naive = datetime.strptime(t, "%Y-%m-%dT%H:%M")
+                if ZoneInfo:
+                    dt = dt_naive.replace(tzinfo=ZoneInfo(tz_name))
+                else:
+                    dt = dt_naive  # fallback naive
+            except Exception:
+                dt = t  # keep raw string if parse fails
+            entries.append({
+                'time': dt,
+                'temp': temp,
+                'weather': code_map.get(c, str(c))
+            })
+        result = {"timezone": tz_name, "entries": entries}
+        _forecast_cache[key] = result
+        return result
     except Exception as e:
         print(f"Error fetching forecast for {lat},{lon}: {e}")
-        return []
+        return {"timezone": "UTC", "entries": []}
 
 class RadarPanel:
     def __init__(self, parent, location, radar_times, loading_callback, get_size_callback):
@@ -61,16 +100,14 @@ class RadarPanel:
         self.composite_images_tk = []
         self.frame_index = 0
         self.map_image_pil = None
-        # Move forecast label to the bottom
-        self.forecast_label = tk.Label(
-            self.panel_frame, bg="black", fg="white", font=("Arial", 10),
-            justify="left", anchor="w", wraplength=400
-        )
-        self.forecast_label.pack(side="bottom", fill="x", pady=(4, 0))
+        # Forecast area (bottom)
+        self.forecast_frame = tk.Frame(self.panel_frame, bg="black")
+        self.forecast_frame.pack(side="bottom", fill="x", pady=(4, 0))
         self.load_map()
         threading.Thread(target=self.load_radar_frames, daemon=True).start()
-        self.panel_frame.after(500, self.update_forecast)
+        self.panel_frame.after(600, self.update_forecast)
 
+    # ----------------- Map & Radar Loading -----------------
     def load_map(self):
         z = 8
         map_url = GOOGLE_MAPS_TEMPLATE.format(
@@ -81,7 +118,7 @@ class RadarPanel:
         )
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
-            r_map = requests.get(map_url, timeout=10, headers=headers)
+            r_map = requests_session.get(map_url, timeout=10, headers=headers)
             r_map.raise_for_status()
             self.map_image_pil = Image.open(io.BytesIO(r_map.content)).convert("RGBA")
         except Exception as e:
@@ -95,9 +132,9 @@ class RadarPanel:
         headers = {"User-Agent": "Mozilla/5.0"}
         if not self.map_image_pil:
             return
-        loaded_count = 0
         total_count = len(self.radar_times)
-        for radar_time in self.radar_times:
+
+        def load_one_frame(radar_time):
             radar_url = TILE_URL_TEMPLATE.format(
                 time=radar_time,
                 z=z,
@@ -105,67 +142,142 @@ class RadarPanel:
                 lon=self.location["lon"]
             )
             try:
-                r_radar = requests.get(radar_url, timeout=10, headers=headers)
+                r_radar = requests_session.get(radar_url, timeout=10, headers=headers)
                 r_radar.raise_for_status()
                 radar_img = Image.open(io.BytesIO(r_radar.content)).convert("RGBA")
                 alpha = radar_img.split()[-1].point(lambda p: int(p * 0.7))
                 radar_img.putalpha(alpha)
                 composite = Image.alpha_composite(self.map_image_pil, radar_img)
-                self.composite_images_pil.append(composite)
+                return composite
             except Exception as e:
                 print(f"Error loading radar for {self.location['name']} at {radar_time}: {e}")
-                self.composite_images_pil.append(self.map_image_pil.copy())
-            loaded_count += 1
-            self.loading_callback(self.location["name"], loaded_count, total_count)
+                return self.map_image_pil.copy()
+
+        results = list(RADAR_THREAD_POOL.map(load_one_frame, self.radar_times))
+        self.composite_images_pil.extend(results)
+        for idx in range(total_count):
+            self.loading_callback(self.location["name"], idx + 1, total_count)
         self.update_scaled_images()
 
     def update_scaled_images(self):
-        # Get current size from callback
-        width, height = self.get_size_callback()
-        self.composite_images_tk.clear()
-        for img in self.composite_images_pil:
-            scaled = img.resize((width, height), Image.LANCZOS)
-            self.composite_images_tk.append(ImageTk.PhotoImage(scaled))
+        # Only once (no dynamic resize)
+        if not self.composite_images_tk:
+            for img in self.composite_images_pil:
+                self.composite_images_tk.append(ImageTk.PhotoImage(img))
 
     def show_frame(self, frame_index):
-        if self.composite_images_tk:
+        if self.composite_images_tk and getattr(self, '_last_frame', None) != frame_index:
             self.composite_image_label.config(image=self.composite_images_tk[frame_index])
+            self._last_frame = frame_index
 
+    # ----------------- Forecast Rendering -----------------
     def update_forecast(self):
-        forecast = get_hourly_forecast(self.location["lat"], self.location["lon"])
-        if forecast:
-            text = "Hourly Forecast:\n"
-            for t, temp, w in forecast:
-                hour = t.split("T")[1][:5]
-                text += f"{hour}: {temp:.1f}°C, {w}\n"
-        else:
-            text = "Hourly Forecast: unavailable"
-        # Update label in main thread
-        self.panel_frame.after(0, lambda: self.forecast_label.config(text=text))
+        data = get_hourly_forecast(self.location["lat"], self.location["lon"])
+        tz_name = data.get("timezone", "") if isinstance(data, dict) else ""
+        entries = data.get("entries", []) if isinstance(data, dict) else []
+        icon_map = {
+            "Clear": "sun.png",
+            "Mainly Clear": "sun_cloud.png",
+            "Partly Cloudy": "cloud.png",
+            "Overcast": "cloud.png",
+            "Fog": "fog.png",
+            "Depositing Rime Fog": "fog.png",
+            "Drizzle": "drizzle.png",
+            "Rain": "rain.png",
+            "Snow": "snow.png",
+            "Rain Showers": "rain.png",
+            "Thunderstorm": "storm.png"
+        }
+        # Clear previous
+        for w in self.forecast_frame.winfo_children():
+            w.destroy()
 
-    def get_hourly_forecast(self, lat, lon):
-        url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lat}&longitude={lon}&hourly=temperature_2m,weathercode&forecast_days=1"
-        )
+        if not entries:
+            tk.Label(self.forecast_frame, text="Forecast unavailable", fg="white", bg="black", font=("Arial", 10)).pack(side="left")
+            return
+
+        # Header with timezone (short form from any entry if possible)
+        from datetime import datetime
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            temps = data["hourly"]["temperature_2m"][:12]
-            codes = data["hourly"]["weathercode"][:12]
-            times = data["hourly"]["time"][:12]
-            # Simple weather code mapping
-            code_map = {
-                0: "Clear", 1: "Mainly Clear", 2: "Partly Cloudy", 3: "Overcast",
-                45: "Fog", 48: "Depositing Rime Fog", 51: "Drizzle", 61: "Rain",
-                71: "Snow", 80: "Rain Showers", 95: "Thunderstorm"
-            }
-            weather = [code_map.get(c, str(c)) for c in codes]
-            return list(zip(times, temps, weather))
-        except Exception as e:
-            print(f"Error fetching forecast for {lat},{lon}: {e}")
-            return []
+            first_dt = entries[0]["time"]
+            if hasattr(first_dt, 'strftime'):
+                tz_abbr = first_dt.strftime('%Z') or tz_name.split('/')[-1]
+            else:
+                tz_abbr = tz_name.split('/')[-1]
+        except Exception:
+            tz_abbr = tz_name.split('/')[-1] if tz_name else ""
+
+        header = tk.Label(self.forecast_frame, text=f"Next 12 hrs ({tz_abbr})", fg="cyan", bg="black", font=("Arial", 10, 'bold'))
+        header.pack(side="top", anchor="w")
+
+        row_frame = tk.Frame(self.forecast_frame, bg="black")
+        row_frame.pack(side="top", fill="x")
+
+        # Use current local hour as starting label, advance by one hour for each entry
+        from datetime import datetime, timedelta
+        if entries:
+            first_dt = entries[0]["time"]
+            if hasattr(first_dt, 'tzinfo') and getattr(first_dt, 'tzinfo', None) is not None:
+                now_local = datetime.now(first_dt.tzinfo)
+            else:
+                now_local = datetime.now()
+            base_hour = now_local.replace(minute=0, second=0, microsecond=0)
+        else:
+            base_hour = None
+
+        last_day = None
+        for idx, entry in enumerate(entries):
+            temp = entry["temp"]
+            weather = entry["weather"]
+            # Synthetic display time based on current hour + idx hours
+            if base_hour:
+                display_dt = base_hour + timedelta(hours=idx)
+                day = display_dt.day
+                hour_str = display_dt.strftime('%I%p').lstrip('0')
+            else:
+                dt_obj = entry["time"]
+                if hasattr(dt_obj, 'strftime'):
+                    day = dt_obj.day
+                    hour_str = dt_obj.strftime('%I%p').lstrip('0')
+                else:
+                    hour_str = str(dt_obj)
+                    day = None
+
+            # Day change separator
+            if last_day is not None and day is not None and day != last_day:
+                sep = tk.Frame(row_frame, width=6, bg="black")
+                sep.pack(side="left")
+                tk.Label(row_frame, text="|", fg="yellow", bg="black").pack(side="left", padx=(0,2))
+            last_day = day if day is not None else last_day
+
+            icon_file = icon_map.get(weather, "unknown.png")
+            icon_path = os.path.join("weather_icons", icon_file)
+            try:
+                icon_img = Image.open(icon_path).resize((30, 30), Image.LANCZOS)
+                icon_tk = ImageTk.PhotoImage(icon_img)
+            except Exception:
+                icon_tk = None
+            cell = tk.Frame(row_frame, bg="black")
+            cell.pack(side="left", padx=2)
+            if icon_tk:
+                lbl_icon = tk.Label(cell, image=icon_tk, bg="black")
+                lbl_icon.image = icon_tk
+                lbl_icon.pack(side="top")
+            tk.Label(cell, text=f"{hour_str}\n{temp:.0f}°C", fg="white", bg="black", font=("Arial", 9)).pack(side="top")
+
+        # Tooltip-ish legend (simple text) for start time
+        try:
+            start_dt = entries[0]["time"]
+            if hasattr(start_dt, 'strftime'):
+                start_str = start_dt.strftime('%a %I:%M %p').lstrip('0')
+            else:
+                start_str = str(start_dt)
+            legend = tk.Label(self.forecast_frame, text=f"Starting {start_str}", fg="#888", bg="black", font=("Arial", 8))
+            legend.pack(side="top", anchor="w")
+        except Exception:
+            pass
+
+requests_session = requests.Session()
 
 class RadarApp:
     def __init__(self, root):
@@ -282,10 +394,7 @@ class RadarApp:
         return panel_width, panel_height
 
     def on_resize(self, event):
-        # Update scaled images on resize
-        for panel in self.panels:
-            panel.update_scaled_images()
-        # Show current frame after resize
+        # Do not update scaled images on resize
         for panel in self.panels:
             panel.show_frame(self.frame_index)
 
