@@ -344,6 +344,17 @@ class RadarApp:
         self.timestamp_label = tk.Label(root, text="", font=("Arial", 16), bg="black", fg="white")
         self.timestamp_label.pack(side="top", fill="x", pady=2)
 
+        # Animation controls frame
+        controls_frame = tk.Frame(root, bg="black")
+        controls_frame.pack(side="top", fill="x", pady=2)
+        self.is_paused = False
+        self.pause_btn = tk.Button(controls_frame, text="⏸ Pause", font=("Arial", 10), command=self.toggle_pause, bg="#222", fg="white")
+        self.pause_btn.pack(side="left", padx=4)
+        self.prev_btn = tk.Button(controls_frame, text="−", font=("Arial", 12, "bold"), width=2, command=self.step_prev, bg="#222", fg="white")
+        self.prev_btn.pack(side="left", padx=2)
+        self.next_btn = tk.Button(controls_frame, text="+", font=("Arial", 12, "bold"), width=2, command=self.step_next, bg="#222", fg="white")
+        self.next_btn.pack(side="left", padx=2)
+
         # Progress bar canvas
         self.progress_canvas = tk.Canvas(root, height=20, bg="black", highlightthickness=0)
         self.progress_canvas.pack(side="top", fill="x", pady=2)
@@ -428,6 +439,8 @@ class RadarApp:
             self.root.after(100, self.check_loading_complete)
 
     def animate(self):
+        if self.is_paused:
+            return
         if self.panels and self.radar_times:
             # Clamp frame_index if radar_times changed
             if self.frame_index >= len(self.radar_times):
@@ -455,7 +468,60 @@ class RadarApp:
             else:
                 delay = int(ANIMATION_DELAY * 1.5)  # Slow down by 50%
                 self.frame_index += 1
-            self.root.after(delay, self.animate)
+            self._anim_after_id = self.root.after(delay, self.animate)
+
+    def toggle_pause(self):
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.pause_btn.config(text="▶ Play")
+            # Cancel scheduled animation if running
+            if hasattr(self, '_anim_after_id') and self._anim_after_id:
+                try:
+                    self.root.after_cancel(self._anim_after_id)
+                except Exception:
+                    pass
+                self._anim_after_id = None
+        else:
+            self.pause_btn.config(text="⏸ Pause")
+            self.animate()
+
+    def step_prev(self):
+        if not self.radar_times:
+            return
+        self.is_paused = True
+        self.pause_btn.config(text="▶ Play")
+        self.frame_index = (self.frame_index - 1) % len(self.radar_times)
+        for panel in self.panels:
+            panel.show_frame(self.frame_index)
+        self.update_progress_bar()
+        timestamp = self.radar_times[self.frame_index]
+        try:
+            dt = datetime.fromtimestamp(int(timestamp), UTC)
+            time_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            time_str = str(timestamp)
+        self.timestamp_label.config(
+            text=f"Frame {self.frame_index + 1}/{len(self.radar_times)} | Radar Time: {time_str}"
+        )
+
+    def step_next(self):
+        if not self.radar_times:
+            return
+        self.is_paused = True
+        self.pause_btn.config(text="▶ Play")
+        self.frame_index = (self.frame_index + 1) % len(self.radar_times)
+        for panel in self.panels:
+            panel.show_frame(self.frame_index)
+        self.update_progress_bar()
+        timestamp = self.radar_times[self.frame_index]
+        try:
+            dt = datetime.fromtimestamp(int(timestamp), UTC)
+            time_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            time_str = str(timestamp)
+        self.timestamp_label.config(
+            text=f"Frame {self.frame_index + 1}/{len(self.radar_times)} | Radar Time: {time_str}"
+        )
 
     def update_progress_bar(self):
         self.progress_canvas.delete("all")
