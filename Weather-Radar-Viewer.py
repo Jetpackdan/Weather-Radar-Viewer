@@ -18,7 +18,7 @@ GOOGLE_MAPS_API_KEY = "AIzaSyD3oN5YeEhwEQvmKkN0fNY-EHm6uBa11Qk"
 
 LOCATIONS = [
     {"name": "Miami, FL", "lat": 25.7617, "lon": -80.1918},
-    {"name": "Portland, OR", "lat": 45.5152, "lon": -122.6784}
+    {"name": "Klamath Falls, OR", "lat": 42.2249, "lon": -121.7817}
 ]
 
 
@@ -114,6 +114,10 @@ class RadarPanel:
         self.panel_frame.pack(side="left", fill="both", expand=True)
         self.label = tk.Label(self.panel_frame, bg="black", text=location["name"], fg="white", font=("Arial", 14))
         self.label.pack(fill="x", expand=False)
+        self.show_alerts_var = tk.BooleanVar(value=False)
+        self.alerts_checkbox = None
+        self.alerts_frame = tk.Frame(self.panel_frame, bg="black")
+        self.alerts_frame.pack(fill="x", expand=False)
         self.composite_image_label = tk.Label(self.panel_frame, bg="black")
         self.composite_image_label.pack(fill="both", expand=True)
         self.composite_images_pil = []
@@ -126,6 +130,78 @@ class RadarPanel:
         self.load_map()
         threading.Thread(target=self.load_radar_frames, daemon=True).start()
         self.panel_frame.after(600, self.update_forecast)
+        self.panel_frame.after(800, self.check_alerts_and_update_ui)
+
+    def check_alerts_and_update_ui(self):
+        alerts = self.get_noaa_alerts()
+        # Remove checkbox if present
+        if self.alerts_checkbox and self.alerts_checkbox.winfo_exists():
+            self.alerts_checkbox.pack_forget()
+        # Only show checkbox if there are alerts
+        if alerts:
+            if not self.alerts_checkbox:
+                self.alerts_checkbox = tk.Checkbutton(
+                    self.panel_frame,
+                    text="Show Alerts",
+                    variable=self.show_alerts_var,
+                    command=self.toggle_alerts,
+                    bg="black",
+                    fg="red",
+                    selectcolor="#222",
+                    font=("Arial", 10)
+                )
+            self.alerts_checkbox.pack(fill="x", anchor="w", padx=2)
+        # If checkbox is checked, show alerts
+        if self.show_alerts_var.get() and alerts:
+            self.update_alerts(alerts)
+        else:
+            for w in self.alerts_frame.winfo_children():
+                w.destroy()
+            self.alerts_frame.pack_forget()
+
+    def toggle_alerts(self):
+        alerts = self.get_noaa_alerts()
+        if self.show_alerts_var.get() and alerts:
+            self.update_alerts(alerts)
+            self.alerts_frame.pack(fill="x", expand=False)
+        else:
+            for w in self.alerts_frame.winfo_children():
+                w.destroy()
+            self.alerts_frame.pack_forget()
+
+    def update_alerts(self, alerts):
+        for w in self.alerts_frame.winfo_children():
+            w.destroy()
+        if alerts:
+            for alert in alerts:
+                tk.Label(self.alerts_frame, text=alert, fg="red", bg="black", font=("Arial", 10, "bold"), wraplength=220, justify="left").pack(side="top", anchor="w", padx=2, pady=1)
+
+    def get_noaa_alerts(self):
+        # Use NOAA API for alerts for the location
+        lat = self.location["lat"]
+        lon = self.location["lon"]
+        url = f"https://api.weather.gov/alerts/active?point={lat},{lon}"
+        try:
+            r = requests_session.get(url, timeout=10, headers={"User-Agent": "RadarViewer/1.0"})
+            r.raise_for_status()
+            data = r.json()
+            features = data.get("features", [])
+            alerts = []
+            for f in features:
+                props = f.get("properties", {})
+                headline = props.get("headline")
+                event = props.get("event")
+                desc = props.get("description")
+                # Prefer headline, else event, else short description
+                if headline:
+                    alerts.append(headline)
+                elif event:
+                    alerts.append(event)
+                elif desc:
+                    alerts.append(desc[:60] + "..." if len(desc) > 60 else desc)
+            return alerts
+        except Exception:
+            return []
 
     # ----------------- Map & Radar Loading -----------------
     def load_map(self):
