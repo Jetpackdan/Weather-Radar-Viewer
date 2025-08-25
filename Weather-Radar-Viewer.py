@@ -14,6 +14,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import threading
 import time
 from datetime import datetime, UTC
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
 
 RAINVIEWER_API = "https://api.rainviewer.com/public/weather-maps.json"
 TILE_URL_TEMPLATE = "https://tilecache.rainviewer.com/v2/radar/{time}/256/{z}/{lat}/{lon}/2/1_1.png"
@@ -40,9 +44,11 @@ REFRESH_INTERVAL = 30000   # Fallback poll interval (ms)
 DELAY_AFTER_FRAME_AVAILABLE_MS = 30000  # Wait 30s after expected new frame time before fetching
 ANIMATION_DELAY = 120      # ms between frames
 EXTENDED_MAX_FRAMES = 50  # Number of frames to retain locally for extended animation
+FORECAST_REFRESH_MS = 30 * 60 * 1000  # 30 minutes
 
 # Forecast cache
 _forecast_cache = {}
+_forecast_cache_time = {}
 def get_hourly_forecast(lat, lon):
     """Return structured 12-hour local forecast using NOAA NWS API.
     Structure: {
@@ -53,7 +59,10 @@ def get_hourly_forecast(lat, lon):
     """
     key = (lat, lon)
     if key in _forecast_cache:
-        return _forecast_cache[key]
+        # Serve cached if fresher than refresh interval
+        ts = _forecast_cache_time.get(key, 0)
+        if (time.time() - ts) < (FORECAST_REFRESH_MS / 1000.0):
+            return _forecast_cache[key]
     try:
         # Step 1: Get gridpoint for lat/lon
         url_points = f"https://api.weather.gov/points/{lat},{lon}"
@@ -72,7 +81,12 @@ def get_hourly_forecast(lat, lon):
         for p in periods:
             # p: dict with startTime, temperature, windSpeed, windDirection, shortForecast, probabilityOfPrecipitation
             try:
-                dt = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(p["startTime"].replace("Z", "+00:00"))  # UTC
+                if ZoneInfo and tz_name:
+                    try:
+                        dt = dt.astimezone(ZoneInfo(tz_name))
+                    except Exception:
+                        pass
             except Exception:
                 dt = p["startTime"]
             temp = p.get("temperature")
@@ -110,6 +124,7 @@ def get_hourly_forecast(lat, lon):
             })
         result = {"timezone": tz_name, "entries": entries}
         _forecast_cache[key] = result
+        _forecast_cache_time[key] = time.time()
         return result
     except Exception as e:
         print(f"Error fetching NOAA forecast for {lat},{lon}: {e}")
@@ -121,23 +136,47 @@ class RadarPanel:
         self.radar_times = radar_times
         self.loading_callback = loading_callback
         self.get_size_callback = get_size_callback
+
+        # Container
         self.panel_frame = tk.Frame(parent, bg="black")
         self.panel_frame.pack(side="left", fill="both", expand=True)
+
+        # Header label
         self.label = tk.Label(self.panel_frame, bg="black", text=location["name"], fg="white", font=("Arial", 14))
         self.label.pack(fill="x", expand=False)
+
+        # Manual forecast refresh button
+        self.refresh_btn = tk.Button(
+            self.panel_frame,
+            text="↻ Forecast",
+            command=self.manual_refresh_forecast,
+            font=("Segoe UI", 9),
+            bg="#203050",
+            fg="white",
+            relief="flat"
+        )
+        self.refresh_btn.pack(fill="x", padx=2, pady=(0, 4))
+
+        # Alerts controls
         self.show_alerts_var = tk.BooleanVar(value=False)
         self.alerts_checkbox = None
         self.alerts_frame = tk.Frame(self.panel_frame, bg="black")
         self.alerts_frame.pack(fill="x", expand=False)
+
+        # Image area
         self.composite_image_label = tk.Label(self.panel_frame, bg="black")
         self.composite_image_label.pack(side="right", fill="both", expand=True)
         self.composite_images_pil = []
         self.composite_images_tk = []
         self.frame_index = 0
         self.map_image_pil = None
-        # Forecast/info area (left side)
+
+        # Forecast/info side panel
         self.info_frame = tk.Frame(self.panel_frame, bg="#101020")
         self.info_frame.pack(side="left", fill="y", padx=(6, 0), pady=(0, 0))
+        self._forecast_after_id = None
+
+        # Start loading resources
         self.load_map()
         threading.Thread(target=self.load_radar_frames, daemon=True).start()
         self.panel_frame.after(600, self.update_forecast)
@@ -267,18 +306,11 @@ class RadarPanel:
             ix = int(round(width / 2 + dx))
             iy = int(round(height / 2 + dy))
             if -5 <= ix <= width + 5 and -5 <= iy <= height + 5:
-                r = 5
-                # White border
-                draw.ellipse((ix - r, iy - r, ix + r, iy + r), fill="white")
-                # Red fill (slightly smaller)
-                draw.ellipse((ix - (r-2), iy - (r-2), ix + (r-2), iy + (r-2)), fill="#ff2222")
-                # Small stem (triangle) downward
-                stem_h = 6
-                draw.polygon([
-                    (ix, iy + r - 1),
-                    (ix - 2, iy + r - 1 + stem_h),
-                    (ix + 2, iy + r - 1 + stem_h)
-                ], fill="#cc0000")
+                # Simple dot: white outer ring + red center (no stem)
+                r_outer = 5
+                r_inner = 3
+                draw.ellipse((ix - r_outer, iy - r_outer, ix + r_outer, iy + r_outer), fill="white")
+                draw.ellipse((ix - r_inner, iy - r_inner, ix + r_inner, iy + r_inner), fill="#ff2222")
         # Mark so we don't double draw on same instance
         setattr(img, '_pins_added', True)
 
@@ -521,6 +553,26 @@ class RadarPanel:
         canvas.get_tk_widget().pack(side="bottom", fill="x", pady=6)
         self.graph_canvas = canvas
         self.graph_figure = fig
+        # Schedule next automatic refresh (avoid duplicates)
+        try:
+            if self._forecast_after_id:
+                try:
+                    self.info_frame.after_cancel(self._forecast_after_id)
+                except Exception:
+                    pass
+            self._forecast_after_id = self.info_frame.after(FORECAST_REFRESH_MS, self.update_forecast)
+        except Exception:
+            pass
+
+    def manual_refresh_forecast(self):
+        # Clear cached forecast for this location then update immediately
+        try:
+            key = (self.location["lat"], self.location["lon"])
+            _forecast_cache.pop(key, None)
+            _forecast_cache_time.pop(key, None)
+        except Exception:
+            pass
+        self.update_forecast()
 
 requests_session = requests.Session()
 
