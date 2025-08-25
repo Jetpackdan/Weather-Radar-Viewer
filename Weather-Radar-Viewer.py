@@ -1,9 +1,16 @@
 import requests
 from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image, ImageTk, ImageDraw
 import io
-import os
+import math
+import os, sys
+# Stable base directory regardless of how script is launched (Run vs Debug)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import threading
 import time
 from datetime import datetime, UTC
@@ -17,18 +24,22 @@ GOOGLE_MAPS_TEMPLATE = (
 GOOGLE_MAPS_API_KEY = "AIzaSyD3oN5YeEhwEQvmKkN0fNY-EHm6uBa11Qk"
 
 LOCATIONS = [
-    {"name": "Miami, FL", "lat": 25.7617, "lon": -80.1918},
+    {"name": "Portland, OR", "lat": 45.5152, "lon": -122.6784},
     {"name": "Klamath Falls, OR", "lat": 42.2249, "lon": -121.7817}
 ]
 
+# Points of interest (red pins) provided as DMS converted to decimal:
+# 45°33'50.9"N 122°41'29.3"W  -> 45.5641389, -122.6914722
+# 42°15'19.4"N 121°47'03.5"W  -> 42.2553889, -121.7843052
+INTEREST_PINS = [
+    (45.5641389, -122.6914722),
+    (42.2553889, -121.7843052),
+]
 
 REFRESH_INTERVAL = 30000   # Fallback poll interval (ms)
 DELAY_AFTER_FRAME_AVAILABLE_MS = 30000  # Wait 30s after expected new frame time before fetching
 ANIMATION_DELAY = 120      # ms between frames
-MAX_FRAMES = 100
-RADAR_THREAD_POOL = ThreadPoolExecutor(max_workers=4)
 EXTENDED_MAX_FRAMES = 50  # Number of frames to retain locally for extended animation
-
 
 # Forecast cache
 _forecast_cache = {}
@@ -119,14 +130,14 @@ class RadarPanel:
         self.alerts_frame = tk.Frame(self.panel_frame, bg="black")
         self.alerts_frame.pack(fill="x", expand=False)
         self.composite_image_label = tk.Label(self.panel_frame, bg="black")
-        self.composite_image_label.pack(fill="both", expand=True)
+        self.composite_image_label.pack(side="right", fill="both", expand=True)
         self.composite_images_pil = []
         self.composite_images_tk = []
         self.frame_index = 0
         self.map_image_pil = None
-        # Forecast area (bottom)
-        self.forecast_frame = tk.Frame(self.panel_frame, bg="black")
-        self.forecast_frame.pack(side="bottom", fill="x", pady=(4, 0))
+        # Forecast/info area (left side)
+        self.info_frame = tk.Frame(self.panel_frame, bg="#101020")
+        self.info_frame.pack(side="left", fill="y", padx=(6, 0), pady=(0, 0))
         self.load_map()
         threading.Thread(target=self.load_radar_frames, daemon=True).start()
         self.panel_frame.after(600, self.update_forecast)
@@ -217,25 +228,70 @@ class RadarPanel:
             r_map = requests_session.get(map_url, timeout=10, headers=headers)
             r_map.raise_for_status()
             self.map_image_pil = Image.open(io.BytesIO(r_map.content)).convert("RGBA")
+            try:
+                self._add_interest_pins(self.map_image_pil, z)
+            except Exception as e:
+                print(f"Pin overlay error for {self.location['name']}: {e}")
         except Exception as e:
             print(f"Error loading Google map for {self.location['name']}: {e}")
             self.map_image_pil = None
 
-    def load_radar_frames(self):
-        """Load radar frames, using local cache for extended animation length.
-
-        Composite images are cached on disk under radar_cache/<location>/ <timestamp>.png
-        We attempt to reuse existing composites for older frames beyond API-provided list.
+    def _add_interest_pins(self, img, zoom):
+        """Overlay red pins for INTEREST_PINS on the static map image.
+        Uses Web Mercator projection to translate lat/lon to pixel offsets.
         """
+        # Make idempotent: skip if we've already added pins to this PIL Image instance
+        if not img or getattr(img, '_pins_added', False):
+            return
+        width, height = img.size  # expected 256x256
+        if width == 0 or height == 0:
+            return
+        # Helper: lat/lon -> world pixels at given zoom
+        def world_px(lat, lon, z):
+            scale = 256 * (2 ** z)
+            x = (lon + 180.0) / 360.0 * scale
+            siny = math.sin(math.radians(lat))
+            # Clamp siny to valid range just in case
+            siny = min(max(siny, -0.9999), 0.9999)
+            y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * scale
+            return x, y
+        center_lat = self.location['lat']
+        center_lon = self.location['lon']
+        cx, cy = world_px(center_lat, center_lon, zoom)
+        draw = ImageDraw.Draw(img)
+        for plat, plon in INTEREST_PINS:
+            px, py = world_px(plat, plon, zoom)
+            dx = px - cx
+            dy = py - cy
+            # Translate to image pixels (center of map at width/2, height/2)
+            ix = int(round(width / 2 + dx))
+            iy = int(round(height / 2 + dy))
+            if -5 <= ix <= width + 5 and -5 <= iy <= height + 5:
+                r = 5
+                # White border
+                draw.ellipse((ix - r, iy - r, ix + r, iy + r), fill="white")
+                # Red fill (slightly smaller)
+                draw.ellipse((ix - (r-2), iy - (r-2), ix + (r-2), iy + (r-2)), fill="#ff2222")
+                # Small stem (triangle) downward
+                stem_h = 6
+                draw.polygon([
+                    (ix, iy + r - 1),
+                    (ix - 2, iy + r - 1 + stem_h),
+                    (ix + 2, iy + r - 1 + stem_h)
+                ], fill="#cc0000")
+        # Mark so we don't double draw on same instance
+        setattr(img, '_pins_added', True)
+
+    def load_radar_frames(self):
+        """Load radar frames (with caching) and build composite images list."""
         self.composite_images_pil.clear()
         self.composite_images_tk.clear()
         if not self.map_image_pil:
             return
         z = 8
         headers = {"User-Agent": "Mozilla/5.0"}
-        # Prepare cache directory per location
         safe_loc = ''.join(c if c.isalnum() else '_' for c in self.location['name']).lower()
-        cache_dir = os.path.join('radar_cache', safe_loc)
+        cache_dir = os.path.join(BASE_DIR, 'radar_cache', safe_loc)
         os.makedirs(cache_dir, exist_ok=True)
 
         def cache_path(ts):
@@ -247,55 +303,62 @@ class RadarPanel:
             path = cache_path(ts)
             if os.path.exists(path):
                 try:
-                    return Image.open(path).convert("RGBA")
+                    cached = Image.open(path).convert("RGBA")
+                    # Ensure pins are present (idempotent)
+                    try:
+                        self._add_interest_pins(cached, z)
+                    except Exception:
+                        pass
+                    return cached
                 except Exception:
-                    pass  # fall through to refetch
-            # Attempt fetch (may fail for very old frames that RainViewer no longer serves)
-            radar_url = TILE_URL_TEMPLATE.format(
-                time=ts,
-                z=z,
-                lat=self.location["lat"],
-                lon=self.location["lon"]
-            )
+                    pass
+            radar_url = TILE_URL_TEMPLATE.format(time=ts, z=z, lat=self.location['lat'], lon=self.location['lon'])
             try:
                 r_radar = requests_session.get(radar_url, timeout=10, headers=headers)
                 r_radar.raise_for_status()
                 radar_img = Image.open(io.BytesIO(r_radar.content)).convert("RGBA")
-                # Semi-transparent radar overlay
                 alpha = radar_img.split()[-1].point(lambda p: int(p * 0.7))
                 radar_img.putalpha(alpha)
-                composite = Image.alpha_composite(self.map_image_pil, radar_img)
-                # Save composite to cache
+                # Start from a copy of base map with pins so pins stay on top
+                base_with_pins = self.map_image_pil.copy()
+                try:
+                    # Reapply pins (map already had them, but ensure visibility on top of radar)
+                    self._add_interest_pins(base_with_pins, z)
+                except Exception:
+                    pass
+                composite = Image.alpha_composite(base_with_pins, radar_img)
                 try:
                     composite.save(path, format='PNG')
                 except Exception as e:
                     print(f"Cache save failed {path}: {e}")
                 return composite
             except Exception as e:
-                # If fetch fails, try existing cached file again or fall back to map
                 if os.path.exists(path):
                     try:
                         return Image.open(path).convert("RGBA")
                     except Exception:
                         pass
                 print(f"Radar fetch failed for {self.location['name']} {ts}: {e}")
-                return self.map_image_pil.copy()
+                img = self.map_image_pil.copy()
+                draw = ImageDraw.Draw(img)
+                w, h = img.size
+                draw.line((0, 0, w, h), fill=(255, 0, 0, 80), width=6)
+                draw.line((0, h, w, 0), fill=(255, 0, 0, 80), width=6)
+                return img
 
-        # Sequentially load to respect ordering; could be parallelized but 50 small PNGs is fine
         for idx, ts in enumerate(self.radar_times):
             img = load_or_fetch(ts)
+            # Safety: ensure pins for every frame (cached ones may have been saved before pin feature existed)
+            try:
+                self._add_interest_pins(img, z)
+            except Exception:
+                pass
             self.composite_images_pil.append(img)
-            self.loading_callback(self.location["name"], idx + 1, total_count)
+            self.loading_callback(self.location['name'], idx + 1, total_count)
 
-        # Trim on-disk cache to EXTENDED_MAX_FRAMES (oldest first)
         try:
             cached_files = [f for f in os.listdir(cache_dir) if f.endswith('.png')]
-            # Extract timestamps that are numeric
-            parsed = []
-            for f in cached_files:
-                name = f.rsplit('.', 1)[0]
-                if name.isdigit():
-                    parsed.append(int(name))
+            parsed = [int(f.rsplit('.', 1)[0]) for f in cached_files if f.rsplit('.', 1)[0].isdigit()]
             parsed.sort()
             if len(parsed) > EXTENDED_MAX_FRAMES:
                 to_delete = parsed[0:len(parsed)-EXTENDED_MAX_FRAMES]
@@ -317,25 +380,52 @@ class RadarPanel:
                 self.composite_images_tk.append(ImageTk.PhotoImage(img))
 
     def show_frame(self, frame_index):
+        total = len(self.composite_images_tk)
+        if total == 0:
+            return
+        if frame_index >= total:
+            frame_index = total - 1
         if self.composite_images_tk and getattr(self, '_last_frame', None) != frame_index:
             self.composite_image_label.config(image=self.composite_images_tk[frame_index])
             self._last_frame = frame_index
 
+        # Show missing radar message if this frame is a map with X
+        # Check if the image is a map with X by looking for the faint X (red lines)
+        # We'll use a flag: if radar fetch failed, we set a flag in composite_images_pil
+        # Instead, let's check if the image is identical to map_image_pil (approximate)
+        # We'll set a message if the frame is missing radar
+        if hasattr(self, 'missing_label') and self.missing_label.winfo_exists():
+            self.missing_label.destroy()
+        if frame_index >= len(self.composite_images_pil):
+            return
+        img = self.composite_images_pil[frame_index]
+        # Heuristic: if the image is not from cache and has a faint X, show message
+        # We'll check if the image is not from cache by checking if the pixel at (10,10) is reddish and not like the map
+        try:
+            px = img.getpixel((10,10))
+            # If the red channel is high and alpha is not 0, likely the X
+            if px[0] > 200 and px[1] < 100 and px[2] < 100 and px[3] > 50:
+                self.missing_label = tk.Label(self.panel_frame, text="No radar image available for this time. The X means radar data is missing.", fg="#ff6666", bg="black", font=("Arial", 8), wraplength=220, justify="center")
+                self.missing_label.pack(side="bottom", fill="x", pady=(2, 2))
+        except Exception:
+            pass
+
     # ----------------- Forecast Rendering -----------------
     def update_forecast(self):
+        """Fetch forecast, render grid + embedded temp/precip graph."""
         data = get_hourly_forecast(self.location["lat"], self.location["lon"])
         tz_name = data.get("timezone", "") if isinstance(data, dict) else ""
         entries = data.get("entries", []) if isinstance(data, dict) else []
-        # Clear previous
-        for w in self.forecast_frame.winfo_children():
+
+        # Clear previous children
+        for w in self.info_frame.winfo_children():
             w.destroy()
 
         if not entries:
-            tk.Label(self.forecast_frame, text="Forecast unavailable", fg="white", bg="black", font=("Arial", 10)).pack(side="left")
+            tk.Label(self.info_frame, text="Forecast unavailable", fg="white", bg="#101020", font=("Segoe UI", 10)).pack(anchor="w")
             return
 
-        # Header with timezone (short form from any entry if possible)
-        from datetime import datetime
+        # Timezone abbreviation
         try:
             first_dt = entries[0]["time"]
             if hasattr(first_dt, 'strftime'):
@@ -345,14 +435,17 @@ class RadarPanel:
         except Exception:
             tz_abbr = tz_name.split('/')[-1] if tz_name else ""
 
-        header = tk.Label(self.forecast_frame, text=f"Next 12 hrs ({tz_abbr})", fg="cyan", bg="black", font=("Arial", 10, 'bold'))
-        header.pack(side="top", anchor="w")
+        header = tk.Label(self.info_frame, text=f"Next 12 hrs ({tz_abbr})", fg="cyan", bg="#101020", font=("Segoe UI", 10, 'bold'))
+        header.pack(anchor="w")
 
-        row_frame = tk.Frame(self.forecast_frame, bg="black")
-        row_frame.pack(side="top", fill="x")
+        # Grid
+        columns = ["Hour", "Temp", "Weather", "Precip", "Wind"]
+        grid_frame = tk.Frame(self.info_frame, bg="#101020")
+        grid_frame.pack(fill="x")
+        for col, name in enumerate(columns):
+            tk.Label(grid_frame, text=name, fg="cyan", bg="#101020", font=("Segoe UI", 9, "bold"), borderwidth=1, relief="ridge", padx=2, pady=2).grid(row=0, column=col, sticky="nsew")
 
-        last_day = None
-        for entry in entries:
+        for i, entry in enumerate(entries):
             dt_obj = entry["time"]
             temp = entry["temp"]
             weather = entry["weather"]
@@ -360,121 +453,233 @@ class RadarPanel:
             wind_speed = entry.get("wind_speed")
             wind_dir = entry.get("wind_dir")
             if hasattr(dt_obj, 'strftime'):
-                day = dt_obj.day
-                hour_str = dt_obj.strftime('%I%p').lstrip('0')
+                hour_str = dt_obj.strftime('%a %I%p').lstrip('0')
             else:
-                try:
-                    hour_str = str(dt_obj).split('T')[1][:5]
-                except Exception:
-                    hour_str = str(dt_obj)
-                day = None
-
-            # Day change separator
-            if last_day is not None and day is not None and day != last_day:
-                sep = tk.Frame(row_frame, width=6, bg="black")
-                sep.pack(side="left")
-                tk.Label(row_frame, text="|", fg="yellow", bg="black").pack(side="left", padx=(0,2))
-            last_day = day if day is not None else last_day
-
-            cell = tk.Frame(row_frame, bg="black")
-            cell.pack(side="left", padx=2)
-            extra = f"\n{int(pop)}%" if isinstance(pop, (int, float)) else ""
+                hour_str = str(dt_obj)
+            precip_txt = f"{int(pop)}%" if isinstance(pop, (int, float)) else ""
             wind_txt = ""
             if wind_speed is not None and wind_dir is not None:
-                # Wind direction as arrow and degrees
-                arrow = "↑"
-                deg = int(wind_dir)
                 arrows = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"]
-                idx = int(((deg + 22.5) % 360) // 45)
-                arrow = arrows[idx]
-                wind_txt = f"\n{arrow} {wind_speed:.1f}m/s"
-            # Truncate weather description to max 16 chars
+                idx = int(((int(wind_dir) + 22.5) % 360) // 45)
+                wind_txt = f"{arrows[idx]} {wind_speed:.1f}m/s"
             weather_short = weather if len(str(weather)) <= 16 else str(weather)[:13] + "..."
-            tk.Label(cell, text=f"{hour_str}\n{temp:.0f}°C\n{weather_short}{extra}{wind_txt}", fg="white", bg="black", font=("Arial", 9), wraplength=60, justify="center").pack(side="top")
+            row_data = [hour_str, f"{temp:.0f}°C", weather_short, precip_txt, wind_txt]
+            for col, val in enumerate(row_data):
+                tk.Label(grid_frame, text=val, fg="white", bg="#101020", font=("Segoe UI", 9), borderwidth=1, relief="groove", padx=2, pady=2).grid(row=i+1, column=col, sticky="nsew")
 
-        # Tooltip-ish legend (simple text) for start time
+        # Legend
         try:
-            start_dt = entries[0]["time"]
-            end_dt = entries[-1]["time"]
+            start_dt = entries[0]["time"]; end_dt = entries[-1]["time"]
             if hasattr(start_dt, 'strftime') and hasattr(end_dt, 'strftime'):
-                start_str = start_dt.strftime('%a %I:%M %p').lstrip('0')
-                end_str = end_dt.strftime('%I:%M %p').lstrip('0')
-                legend_text = f"Covers {start_str} to {end_str}"
+                legend_text = f"Covers {start_dt.strftime('%a %I:%M %p').lstrip('0')} to {end_dt.strftime('%I:%M %p').lstrip('0')}"
             else:
                 legend_text = f"Starting {start_dt}"
-            legend = tk.Label(self.forecast_frame, text=legend_text, fg="#888", bg="black", font=("Arial", 8))
-            legend.pack(side="top", anchor="w")
+            tk.Label(self.info_frame, text=legend_text, fg="#888", bg="#101020", font=("Segoe UI", 8)).pack(anchor="w", pady=(4,0))
         except Exception:
             pass
+
+        # Graph data
+        temps = [e["temp"] for e in entries]
+        pops = [ (e.get("pop") or 0) for e in entries]
+        hours = []
+        for e in entries:
+            dt_obj = e["time"]
+            if hasattr(dt_obj, 'strftime'):
+                hours.append(dt_obj.strftime('%I%p').lstrip('0'))
+            else:
+                hours.append(str(dt_obj))
+        xvals = list(range(len(hours)))
+
+        # Cleanup previous graph
+        if hasattr(self, 'graph_canvas'):
+            try:
+                if self.graph_canvas:
+                    self.graph_canvas.get_tk_widget().destroy()
+                if hasattr(self, 'graph_figure') and self.graph_figure:
+                    plt.close(self.graph_figure)
+            except Exception:
+                pass
+
+        fig, ax1 = plt.subplots(figsize=(3, 2.0), dpi=100)
+        ax1.plot(xvals, temps, color='tab:red', marker='o')
+        ax1.set_ylabel('Temp (°C)', color='tab:red')
+        ax1.tick_params(axis='y', labelcolor='tab:red')
+        ax1.set_xticks(xvals)
+        ax1.set_xticklabels(hours, rotation=45, fontsize=8)
+        ax1.set_ylim(bottom=0)
+        ax1.set_xlim(-0.2, len(xvals)-0.8)
+
+        ax2 = ax1.twinx()
+        ax2.plot(xvals, pops, color='tab:blue', marker='x', linestyle='--')
+        ax2.set_ylabel('Precip (%)', color='tab:blue')
+        ax2.tick_params(axis='y', labelcolor='tab:blue')
+        ax2.set_ylim(0, 100)
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.info_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side="bottom", fill="x", pady=6)
+        self.graph_canvas = canvas
+        self.graph_figure = fig
 
 requests_session = requests.Session()
 
 
 class RadarApp:
     def __init__(self, root):
+        # Root / window setup
         self.root = root
         self.root.title("Oregon Radar: Portland & Klamath Falls (Animated Layered Radar + Google Maps)")
         self.root.geometry("900x400")
+        self.closing = False
 
-        # Timestamp label at top center
-        self.timestamp_label = tk.Label(root, text="", font=("Arial", 16), bg="black", fg="white")
-        self.timestamp_label.pack(side="top", fill="x", pady=2)
+        # Gradient background
+        self.bg_canvas = tk.Canvas(self.root, width=900, height=400, highlightthickness=0, bd=0)
+        self.bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.draw_gradient()
 
-        # Animation controls frame
-        controls_frame = tk.Frame(root, bg="black")
-        controls_frame.pack(side="top", fill="x", pady=2)
+        # Timestamp label
+        self.timestamp_label = tk.Label(self.root, text="", font=("Segoe UI", 16, "bold"), bg="#101020", fg="cyan")
+        self.timestamp_label.pack(side="top", fill="x", pady=6)
+
+        # Animation controls
+        controls_frame = tk.Frame(self.root, bg="#101020")
+        controls_frame.pack(side="top", fill="x", pady=4)
         self.is_paused = False
-        self.pause_btn = tk.Button(controls_frame, text="⏸ Pause", font=("Arial", 10), command=self.toggle_pause, bg="#222", fg="white")
-        self.pause_btn.pack(side="left", padx=4)
-        self.prev_btn = tk.Button(controls_frame, text="−", font=("Arial", 12, "bold"), width=2, command=self.step_prev, bg="#222", fg="white")
+        self.pause_btn = tk.Button(controls_frame, text="⏸ Pause", font=("Segoe UI", 10), command=self.toggle_pause, bg="#1a2340", fg="white", relief="flat")
+        self.pause_btn.pack(side="left", padx=6, pady=2)
+        self.prev_btn = tk.Button(controls_frame, text="−", font=("Segoe UI", 12, "bold"), width=2, command=self.step_prev, bg="#1a2340", fg="white", relief="flat")
         self.prev_btn.pack(side="left", padx=2)
-        self.next_btn = tk.Button(controls_frame, text="+", font=("Arial", 12, "bold"), width=2, command=self.step_next, bg="#222", fg="white")
+        self.next_btn = tk.Button(controls_frame, text="+", font=("Segoe UI", 12, "bold"), width=2, command=self.step_next, bg="#1a2340", fg="white", relief="flat")
         self.next_btn.pack(side="left", padx=2)
 
-        # Progress bar canvas
-        self.progress_canvas = tk.Canvas(root, height=20, bg="black", highlightthickness=0)
-        self.progress_canvas.pack(side="top", fill="x", pady=2)
+        # Animation frame progress bar
+        self.progress_canvas = tk.Canvas(self.root, height=24, bg="#101020", highlightthickness=0)
+        self.progress_canvas.pack(side="top", fill="x", pady=4)
 
-        # Loading screen
-        self.loading_label = tk.Label(root, text="Loading radar images...", font=("Arial", 14), bg="black", fg="yellow")
-        self.loading_label.pack(side="top", fill="x", pady=5)
+        # Loading banner
+        self.loading_label = tk.Label(self.root, text="Loading radar images...", font=("Segoe UI", 14), bg="#101020", fg="#ffcc00")
+        self.loading_label.pack(side="top", fill="x", pady=8)
 
-        # Container frame for radar panels
-        self.frame = tk.Frame(root, bg="black")
-        self.frame.pack(fill="both", expand=True)
+        # Main container for panels
+        self.frame = tk.Frame(self.root, bg="", highlightthickness=0)
+        self.frame.pack(fill="both", expand=True, padx=12, pady=8)
 
-        # Countdown label (top right)
-        self.countdown_label = tk.Label(root, text="", font=("Arial", 12), bg="black", fg="cyan")
+        # Countdown label & bar (top-right)
+        self.countdown_label = tk.Label(self.root, text="", font=("Segoe UI", 12), bg="#101020", fg="cyan")
         self.countdown_label.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
+        self.countdown_bar = tk.Canvas(self.root, width=140, height=6, bg="#202030", highlightthickness=0, bd=0)
+        self.countdown_bar.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=34)
+        self._countdown_total = 0
 
-        # Initial radar times
-        self.radar_times = self.get_latest_radar_times()
+        # Data initialization
+        self.radar_times = self._extend_with_cached_frames(self.get_latest_radar_times())
         self.loading_status = {loc["name"]: 0 for loc in LOCATIONS}
-
-        # Panel sizing
         self.panel_width = 256
         self.panel_height = 256
-
-        # Create radar panels
         self.panels = [
             RadarPanel(self.frame, LOCATIONS[0], self.radar_times, self.update_loading, self.get_panel_size),
             RadarPanel(self.frame, LOCATIONS[1], self.radar_times, self.update_loading, self.get_panel_size)
         ]
-
         self.frame_index = 0
 
         # Key bindings
         self.root.bind("<Escape>", lambda e: self.root.destroy())
         self.root.bind("<Configure>", self.on_resize)
 
-        # Start loading check
+        # Load state check
         self.check_loading_complete()
 
-        # Predictive scheduling: will align refresh with expected next frame time + delay
+        # Scheduling
         self._refresh_after_id = None
         self.next_refresh_timestamp = time.time() + (REFRESH_INTERVAL/1000)
         self.schedule_next_refresh(initial=True)
         self.update_countdown()
+
+        # Window close protocol
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ----------------- Clean Shutdown -----------------
+    def on_close(self):
+        if self.closing:
+            return
+        self.closing = True
+        # Cancel scheduled after callbacks if present
+        for attr in (
+            '_anim_after_id',
+            '_refresh_after_id',
+            '_pending_slide_after_id',
+            '_countdown_after_id',
+            '_loading_slide_after_id',
+            '_start_slide_after_id'
+        ):
+            aid = getattr(self, attr, None)
+            if aid:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # Stop countdown recursion by not scheduling further
+        # Close any matplotlib figures
+        try:
+            for panel in getattr(self, 'panels', []):
+                if hasattr(panel, 'graph_figure') and panel.graph_figure:
+                    try:
+                        plt.close(panel.graph_figure)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Close requests session
+        try:
+            requests_session.close()
+        except Exception:
+            pass
+        # Destroy root
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    # Override recurring methods to respect closing flag
+    def update_countdown(self):
+        if getattr(self, 'closing', False):
+            return
+        now = time.time()
+        remaining = int(self.next_refresh_timestamp - now)
+        if remaining >= 0:
+            try:
+                mins, secs = divmod(remaining, 60)
+                self.countdown_label.config(text=f"Next radar: {mins:02d}:{secs:02d}")
+                # Update bar
+                if self._countdown_total > 0 and self.countdown_bar.winfo_exists():
+                    frac = max(0.0, min(1.0, (self._countdown_total - remaining) / self._countdown_total))
+                    w = self.countdown_bar.winfo_width() or 140
+                    self.countdown_bar.delete("all")
+                    self.countdown_bar.create_rectangle(0, 0, w, 6, fill="#303848", outline="")
+                    self.countdown_bar.create_rectangle(0, 0, int(w * frac), 6, fill="#00d0ff", outline="")
+            except Exception:
+                return
+        else:
+            try:
+                self.countdown_label.config(text="Checking for new radar frame...")
+                if self.countdown_bar.winfo_exists():
+                    self.countdown_bar.delete("all")
+            except Exception:
+                return
+        self._countdown_after_id = self.root.after(1000, self.update_countdown)
+
+    def draw_gradient(self):
+        # Draw a vertical gradient from black to dark blue
+        w = 900
+        h = 400
+        for i in range(h):
+            r = 16
+            g = 16
+            b = 32 + int(48 * (i / h))  # from #101020 to #101060
+            color = f'#{r:02x}{g:02x}{b:02x}'
+            self.bg_canvas.create_line(0, i, w, i, fill=color)
 
     def get_latest_radar_times(self):
         try:
@@ -487,6 +692,48 @@ class RadarApp:
         except Exception as e:
             print(f"Error fetching RainViewer radar times: {e}")
             return []
+
+    def _extend_with_cached_frames(self, times):
+        """Prepend older cached frame timestamps (if present on disk) so startup animation
+        can show more than the API's returned recent frames (often ~13). We look into each
+        location cache folder, gather timestamp file names (< earliest API time), merge,
+        and keep up to EXTENDED_MAX_FRAMES total (oldest trimmed)."""
+        if not times:
+            return times
+        try:
+            earliest = int(times[0])  # RainViewer returns ascending past frames
+        except Exception:
+            return times
+        cached_ts = set()
+        for loc in LOCATIONS:
+            safe_loc = ''.join(c if c.isalnum() else '_' for c in loc['name']).lower()
+            cache_dir = os.path.join(BASE_DIR, 'radar_cache', safe_loc)
+            if not os.path.isdir(cache_dir):
+                continue
+            try:
+                for f in os.listdir(cache_dir):
+                    if f.endswith('.png'):
+                        name = f.rsplit('.',1)[0]
+                        if name.isdigit():
+                            val = int(name)
+                            if val < earliest:  # strictly older
+                                cached_ts.add(val)
+            except Exception:
+                pass
+        if not cached_ts:
+            return times
+        merged = sorted(cached_ts) + [int(t) for t in times]
+        # Trim to EXTENDED_MAX_FRAMES from the end (most recent EXTENDED_MAX_FRAMES)
+        if len(merged) > EXTENDED_MAX_FRAMES:
+            merged = merged[-EXTENDED_MAX_FRAMES:]
+        # Convert back to str
+        out = [str(t) for t in merged]
+        if out != times:
+            try:
+                print(f"[Startup] Extended frames using cache: {len(times)} -> {len(out)}")
+            except Exception:
+                pass
+        return out
 
     def update_loading(self, location_name, loaded, total):
         # Ensure UI updates happen on main thread
@@ -506,6 +753,15 @@ class RadarApp:
     def check_loading_complete(self):
         if all(count == len(self.radar_times) for count in self.loading_status.values()):
             self.loading_label.config(text="Radar images loaded!")
+            # Prevent duplicate animation loops (after refresh we may already be animating)
+            if hasattr(self, '_anim_after_id') and self._anim_after_id:
+                try:
+                    self.root.after_cancel(self._anim_after_id)
+                except Exception:
+                    pass
+                self._anim_after_id = None
+            # Start / restart animation fresh
+            self.frame_index = min(self.frame_index, max(0, len(self.radar_times)-1))
             self.animate()
             # Schedule slide-up removal after 20 seconds (only once)
             if not hasattr(self, '_loading_label_slide_scheduled'):
@@ -515,36 +771,53 @@ class RadarApp:
             self.root.after(100, self.check_loading_complete)
 
     def animate(self):
-        if self.is_paused:
+        if self.is_paused or getattr(self, 'closing', False):
             return
-        if self.panels and self.radar_times:
-            # Clamp frame_index if radar_times changed
-            if self.frame_index >= len(self.radar_times):
-                self.frame_index = 0
-            # Show frame
-            for panel in self.panels:
-                panel.show_frame(self.frame_index)
-            # Update timestamp label
+        # Only proceed if all panels have at least one loaded frame
+        if not (self.panels and self.radar_times and all(p.composite_images_tk for p in self.panels)):
+            # Retry shortly until frames available (avoid tight loop)
+            self._anim_after_id = self.root.after(250, self.animate)
+            return
+        # Clamp frame_index if radar_times changed
+        if self.frame_index >= len(self.radar_times):
+            self.frame_index = 0
+        # Show current frame on each panel (guarded internally)
+        for panel in self.panels:
+            panel.show_frame(self.frame_index)
+        # Acquire timestamp safely
+        if self.frame_index < len(self.radar_times):
             timestamp = self.radar_times[self.frame_index]
+        else:
+            timestamp = None
+        # Format timestamp label
+        if timestamp is not None:
             try:
                 dt = datetime.fromtimestamp(int(timestamp), UTC)
                 time_str = dt.strftime("%Y-%m-%d %H:%M UTC")
             except Exception:
                 time_str = str(timestamp)
-            self.timestamp_label.config(
-                text=f"Frame {self.frame_index + 1}/{len(self.radar_times)} | Radar Time: {time_str}"
-            )
-            # Update animated progress bar
-            self.update_progress_bar()
-
-            # Animation delay logic
-            if self.frame_index == len(self.radar_times) - 1:
-                delay = 3000  # 3 seconds pause on most current frame
-                self.frame_index = 0  # After pause, loop to first frame
-            else:
-                delay = int(ANIMATION_DELAY * 1.5)  # Slow down by 50%
-                self.frame_index += 1
-            self._anim_after_id = self.root.after(delay, self.animate)
+        else:
+            time_str = "--"
+        self.timestamp_label.config(
+            text=f"Frame {self.frame_index + 1}/{len(self.radar_times)} | Radar Time: {time_str}"
+        )
+        # Update progress bar
+        self.update_progress_bar()
+        # Decide delay & advance frame: pause whenever displaying CURRENT newest timestamp
+        pause = False
+        try:
+            if timestamp is not None and timestamp == self.radar_times[-1]:
+                pause = True
+        except Exception:
+            pass
+        if pause:
+            delay = 3000  # pause on newest frame
+            # Wrap after pause
+            self.frame_index = 0 if len(self.radar_times) > 0 else 0
+        else:
+            delay = ANIMATION_DELAY
+            self.frame_index = (self.frame_index + 1) % max(1, len(self.radar_times))
+        self._anim_after_id = self.root.after(delay, self.animate)
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -628,9 +901,23 @@ class RadarApp:
         return panel_width, panel_height
 
     def on_resize(self, event):
+        # Redraw gradient background to fit new window size
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        self.bg_canvas.config(width=w, height=h)
+        self.bg_canvas.delete("all")
+        for i in range(h):
+            r = 16
+            g = 16
+            b = 32 + int(48 * (i / max(h, 1)))
+            color = f'#{r:02x}{g:02x}{b:02x}'
+            self.bg_canvas.create_line(0, i, w, i, fill=color)
         # Do not update scaled images on resize
         for panel in self.panels:
-            panel.show_frame(self.frame_index)
+            try:
+                panel.show_frame(self.frame_index)
+            except Exception:
+                pass
 
     def refresh_radar_frames(self):
         # Fetch latest radar times
@@ -680,20 +967,10 @@ class RadarApp:
         # Schedule next predictive refresh
         self.schedule_next_refresh()
 
-    def update_countdown(self):
-        # Derive remaining seconds from timestamp
-        now = time.time()
-        remaining = int(self.next_refresh_timestamp - now)
-        if remaining >= 0:
-            self.countdown_label.config(text=f"Next radar check in {remaining}s")
-        else:
-            self.countdown_label.config(text="Checking for new radar frame...")
-        self.root.after(1000, self.update_countdown)
-
     # ----------------- Loading label slide-up animation -----------------
     def start_loading_label_slide(self):
         # Only proceed if label still exists and was packed
-        if not self.loading_label.winfo_exists():
+        if getattr(self, 'closing', False) or not self.loading_label.winfo_exists():
             return
         try:
             # Convert from pack to place so we can animate y
@@ -714,7 +991,7 @@ class RadarApp:
                 pass
 
     def animate_loading_label_slide(self):
-        if not self.loading_label.winfo_exists():
+        if getattr(self, 'closing', False) or not self.loading_label.winfo_exists():
             return
         self._loading_label_slide_y -= 4  # pixels per frame
         self.loading_label.place_configure(y=self._loading_label_slide_y)
@@ -725,10 +1002,13 @@ class RadarApp:
                 pass
             return
         # Schedule next frame ~16ms (~60fps)
-        self.root.after(16, self.animate_loading_label_slide)
+        if not getattr(self, 'closing', False):
+            self._loading_slide_after_id = self.root.after(16, self.animate_loading_label_slide)
 
     # ----------------- Utility to (re)show loading banner -----------------
     def show_loading_message(self, text, slide_after=None):
+        if getattr(self, 'closing', False):
+            return
         # Recreate label if missing (e.g., after it was destroyed)
         if not getattr(self, 'loading_label', None) or not self.loading_label.winfo_exists():
             self.loading_label = tk.Label(self.root, text=text, font=("Arial", 14), bg="black", fg="yellow")
@@ -743,15 +1023,22 @@ class RadarApp:
             except Exception:
                 return
         if slide_after is not None:
-            self.root.after_cancel(getattr(self, '_pending_slide_after_id', self.root.after(0, lambda: None)))
+            if getattr(self, '_pending_slide_after_id', None):
+                try:
+                    self.root.after_cancel(self._pending_slide_after_id)
+                except Exception:
+                    pass
             def schedule():
                 if not hasattr(self, '_loading_label_slide_scheduled'):
                     self._loading_label_slide_scheduled = True
                     self.start_loading_label_slide()
-            self._pending_slide_after_id = self.root.after(slide_after, schedule)
+            if not getattr(self, 'closing', False):
+                self._pending_slide_after_id = self.root.after(slide_after, schedule)
 
     # ----------------- Predictive scheduling -----------------
     def schedule_next_refresh(self, initial=False, fallback=False):
+        if getattr(self, 'closing', False):
+            return
         # Cancel previous scheduled refresh if any
         if getattr(self, '_refresh_after_id', None):
             try:
@@ -779,11 +1066,20 @@ class RadarApp:
             if fallback:
                 print(f"[Scheduler] Fallback scheduling in {REFRESH_INTERVAL/1000:.0f}s due to fetch error.")
         self.next_refresh_timestamp = now + (delay_ms/1000.0)
-        self._refresh_after_id = self.root.after(delay_ms, self.refresh_radar_frames)
+        # Store total countdown seconds for progress bar
+        self._countdown_total = int(delay_ms/1000.0)
+        if not getattr(self, 'closing', False):
+            self._refresh_after_id = self.root.after(delay_ms, self.refresh_radar_frames)
         if initial:
             print(f"[Scheduler] Initial radar refresh scheduled in {delay_ms/1000:.1f}s.")
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = RadarApp(root)
+    try:
+        root.lift()
+        root.attributes('-topmost', True)
+        root.after(100, lambda: root.attributes('-topmost', False))
+    except Exception:
+        pass
     root.mainloop()
