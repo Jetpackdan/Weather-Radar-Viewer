@@ -9,8 +9,11 @@ from PIL import Image, ImageTk, ImageDraw
 import io
 import math
 import os, sys
-# Stable base directory regardless of how script is launched (Run vs Debug)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Stable base directory: use exe folder if frozen, else script folder
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import threading
 import time
 from datetime import datetime, UTC
@@ -325,6 +328,7 @@ class RadarPanel:
         safe_loc = ''.join(c if c.isalnum() else '_' for c in self.location['name']).lower()
         cache_dir = os.path.join(BASE_DIR, 'radar_cache', safe_loc)
         os.makedirs(cache_dir, exist_ok=True)
+        print(f"[Cache] Using cache directory for {self.location['name']}: {cache_dir}")
 
         def cache_path(ts):
             return os.path.join(cache_dir, f"{ts}.png")
@@ -361,6 +365,7 @@ class RadarPanel:
                 composite = Image.alpha_composite(base_with_pins, radar_img)
                 try:
                     composite.save(path, format='PNG')
+                    print(f"[Cache] Saved radar frame for {self.location['name']} at {path}")
                 except Exception as e:
                     print(f"Cache save failed {path}: {e}")
                 return composite
